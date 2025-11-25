@@ -69,12 +69,20 @@ class SwinUNet_ConvLSTM_SIM(nn.Module):
         self.sim_channels = 2 * self.D * self.N
 
         # -------- Swin encoder --------
-        self.swin = timm.create_model(backbone, pretrained=pretrained, features_only=True)
+        self.swin = timm.create_model(backbone, pretrained=pretrained, features_only=True,in_chans=1)
         swin_ch = self.swin.feature_info.channels()  # list like [96,192,384,768]
         print("⚙️ Swin encoder channels:", swin_ch)
 
         # SIM encoder -> match first stage channels
         self.sim_encoder = nn.Conv2d(self.sim_channels, swin_ch[0], kernel_size=1)
+        self.att_gate = nn.Sequential(
+            nn.Conv2d(self.swin.feature_info.channels()[0] * 2,  # concatenate e1 + sim_feat
+                    self.swin.feature_info.channels()[0],
+                    kernel_size=1),
+            nn.BatchNorm2d(self.swin.feature_info.channels()[0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.swin.feature_info.channels()[0], 1, kernel_size=1)
+        )
 
         # Decoder up layers (simple)
         self.up4 = nn.ConvTranspose2d(swin_ch[3], swin_ch[2], kernel_size=2, stride=2)
@@ -104,7 +112,7 @@ class SwinUNet_ConvLSTM_SIM(nn.Module):
             elif f.shape[-1] == expected_c:
                 f2 = f.permute(0, 3, 1, 2).contiguous()
                 fixed.append(f2)
-                print(f"ℹ️ Permuted feat[{i}] from (B,H,W,C) -> (B,C,H,W)")
+                # print(f"ℹ️ Permuted feat[{i}] from (B,H,W,C) -> (B,C,H,W)")
             else:
                 # fallback: try to adapt channels by 1x1 conv or cropping/padding
                 if f.shape[1] < expected_c:
@@ -112,11 +120,11 @@ class SwinUNet_ConvLSTM_SIM(nn.Module):
                     diff = expected_c - f.shape[1]
                     pad = torch.zeros(f.shape[0], diff, f.shape[2], f.shape[3], device=f.device, dtype=f.dtype)
                     fixed.append(torch.cat([f, pad], dim=1))
-                    print(f"ℹ️ Padded feat[{i}] channels {f.shape[1]} -> {expected_c}")
+                    # print(f"ℹ️ Padded feat[{i}] channels {f.shape[1]} -> {expected_c}")
                 else:
                     # crop
                     fixed.append(f[:, :expected_c, :, :].contiguous())
-                    print(f"ℹ️ Cropped feat[{i}] channels {f.shape[1]} -> {expected_c}")
+                    # print(f"ℹ️ Cropped feat[{i}] channels {f.shape[1]} -> {expected_c}")
         return fixed
 
     def forward(self, x, sim, state=None):
@@ -143,7 +151,11 @@ class SwinUNet_ConvLSTM_SIM(nn.Module):
             else:
                 pad = torch.zeros(sim_feat.shape[0], e1.shape[1] - sim_feat.shape[1], sim_feat.shape[2], sim_feat.shape[3], device=sim_feat.device, dtype=sim_feat.dtype)
                 sim_feat = torch.cat([sim_feat, pad], dim=1)
-        e1 = e1 + sim_feat
+
+        # attention-based SIM fusion
+        att_input = torch.cat([e1, sim_feat], dim=1)
+        gate = torch.sigmoid(self.att_gate(att_input))   # (B,1,H,W)
+        e1 = e1 + gate * sim_feat
 
         # ---- ConvLSTM at bottleneck ----
         # Ensure e4 has channel count ch4
@@ -152,16 +164,16 @@ class SwinUNet_ConvLSTM_SIM(nn.Module):
             # if channels on last dim equal ch4, permute (defensive)
             if e4.shape[-1] == ch4:
                 e4 = e4.permute(0, 3, 1, 2).contiguous()
-                print("ℹ️ Permuted e4 to (B,C,H,W)")
+                # print("ℹ️ Permuted e4 to (B,C,H,W)")
             else:
                 # crop or pad to ch4
                 if e4.shape[1] > ch4:
                     e4 = e4[:, :ch4, :, :].contiguous()
-                    print(f"ℹ️ Cropped e4 channels to {ch4}")
+                    # print(f"ℹ️ Cropped e4 channels to {ch4}")
                 else:
                     pad = torch.zeros(e4.shape[0], ch4 - e4.shape[1], e4.shape[2], e4.shape[3], device=e4.device, dtype=e4.dtype)
                     e4 = torch.cat([e4, pad], dim=1)
-                    print(f"ℹ️ Padded e4 channels to {ch4}")
+                    # print(f"ℹ️ Padded e4 channels to {ch4}")
 
         # Debug shapes before ConvLSTM
         # print(f"Before ConvLSTM: e4 {tuple(e4.shape)}; state given {state is not None}")
@@ -190,35 +202,3 @@ class SwinUNet_ConvLSTM_SIM(nn.Module):
 
         return out, (h, c)
 
-
-# -----------------------------
-# Quick sanity test
-# -----------------------------
-if __name__ == "__main__":
-    num_classes = 2
-    num_seg_classes = 2
-    sim_depth = 3
-    H, W = 256, 256
-
-    model = SwinUNet_ConvLSTM_SIM(
-        num_classes=num_classes,
-        num_seg_classes=num_seg_classes,
-        sim_depth=sim_depth,
-        pretrained=True  
-    )
-    model.eval()
-
-    img = torch.randn(1, 3, H, W)
-    sim = torch.zeros(1, 2 * sim_depth * num_seg_classes, H, W)
-    state = None
-
-    with torch.no_grad():
-        logits, state = model(img, sim, state)
-
-    print("Input image:", img.shape)
-    print("SIM tensor:", sim.shape)
-    print("Output logits:", logits.shape)
-    if state is not None:
-        h, c = state
-        print("ConvLSTM hidden:", h.shape)
-        print("ConvLSTM cell:", c.shape)
